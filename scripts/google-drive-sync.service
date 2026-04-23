@@ -1,0 +1,15 @@
+[Unit]
+Description=Google Drive Sync Bot Service
+After=network.target
+
+[Service]
+# Thay đổi 'username' thành tên user của bạn
+User=username
+# Thay đổi đường dẫn bên dưới cho đúng với thư mục cài đặt của bạn
+WorkingDirectory=/home/username/upload-bot
+ExecStart=/home/username/upload-bot/venv/bin/python3 /home/username/upload-bot/main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

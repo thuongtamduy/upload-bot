@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.googledrivesync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Thay đường dẫn tới file python trong venv -->
+        <string>/Users/yourname/upload-bot/venv/bin/python3</string>
+        <!-- Thay đường dẫn tới file main.py -->
+        <string>/Users/yourname/upload-bot/main.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/yourname/upload-bot</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/yourname/upload-bot/history.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/yourname/upload-bot/history.log</string>
+</dict>
+</plist>
