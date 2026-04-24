@@ -30,7 +30,7 @@ def load_config():
     if not os.path.exists(CONFIG_FILE):
         default_config = {
             "DRIVE_FOLDER_ID": "1Gxd4eejYA3o7Rwwd_W62rP8xBamhGpvW",
-            "WATCH_FOLDER": "data-upload",
+            "WATCH_FOLDERS": ["data-upload"],
             "MAX_UPLOAD_SPEED_MBPS": 0,
             "TELEGRAM_BOT_TOKEN": "",
             "TELEGRAM_CHAT_ID": "",
@@ -50,9 +50,16 @@ def load_config():
             "TELEGRAM_CHAT_ID": "",
             "NOTIFY_SIZE_LIMIT_MB": 5,
             "DELETE_REMOTE_FILES": False,
-            "SYNC_REMOTE_TO_LOCAL": False
+            "SYNC_REMOTE_TO_LOCAL": False,
+            "WATCH_FOLDERS": ["data-upload"]
         }
         updated = False
+        
+        # Migrate cũ sang mới
+        if "WATCH_FOLDER" in cfg:
+            cfg["WATCH_FOLDERS"] = [cfg.pop("WATCH_FOLDER")]
+            updated = True
+            
         for k, v in defaults.items():
             if k not in cfg:
                 cfg[k] = v
@@ -406,12 +413,15 @@ class WatcherHandler(FileSystemEventHandler):
             log_print(f"\n👀 Tiếp tục theo dõi thư mục '{self.folder_path}'... (Bấm Ctrl+C để thoát)")
 
 
-def start_watching(drive_manager, folder_path):
-    event_handler = WatcherHandler(drive_manager, folder_path)
+def start_watching(drive_manager, folder_paths):
     observer = Observer()
-    observer.schedule(event_handler, folder_path, recursive=True)
+    for folder_path in folder_paths:
+        event_handler = WatcherHandler(drive_manager, folder_path)
+        observer.schedule(event_handler, folder_path, recursive=True)
+        log_print(f"\n👀 Đang theo dõi thư mục '{folder_path}'...")
+        
+    log_print(f"\n🚀 Tool đang chạy ngầm... (Bấm Ctrl+C để thoát)")
     observer.start()
-    log_print(f"\n👀 Tool đang chạy ngầm và theo dõi thư mục '{folder_path}'... (Bấm Ctrl+C để thoát)")
     try:
         while True:
             time.sleep(1)
@@ -427,11 +437,17 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
     
     FOLDER_ID = CONFIG.get("DRIVE_FOLDER_ID")
-    folder_to_watch = CONFIG.get("WATCH_FOLDER")
+    folders_to_watch = CONFIG.get("WATCH_FOLDERS", [])
 
-    if not os.path.exists(folder_to_watch):
-        os.makedirs(folder_to_watch)
+    if not folders_to_watch:
+        log_print("❌ Không có thư mục nào để theo dõi trong WATCH_FOLDERS!")
+        os._exit(1)
 
     drive = GoogleDriveManager(FOLDER_ID)
-    drive.upload_directory(folder_to_watch)
-    start_watching(drive, folder_to_watch)
+    
+    for folder_to_watch in folders_to_watch:
+        if not os.path.exists(folder_to_watch):
+            os.makedirs(folder_to_watch)
+        drive.upload_directory(folder_to_watch)
+        
+    start_watching(drive, folders_to_watch)
