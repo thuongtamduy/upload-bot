@@ -46,7 +46,7 @@ CONFIG_DEFAULTS = {
     "DELETE_REMOTE_FILES":   False,
     "SYNC_REMOTE_TO_LOCAL":  False,
     "ENABLE_PARALLEL":       True,
-    "MAX_WORKERS":           5,
+    "MAX_WORKERS":           3,
 }
 
 
@@ -147,6 +147,35 @@ def is_ignored(file_path, base_folder, patterns):
         return False
     except ValueError:
         return False
+
+def _wait_for_stable_size(file_path: str, stable_secs: int = 5, poll_interval: int = 2) -> bool:
+    """
+    Chờ cho đến khi kích thước file không đổi trong ít nhất stable_secs giây.
+
+    Mục đích: tránh upload file đang được ghi dở (race condition với backup server).
+
+    Returns:
+        True  — file ổn định, sẵn sàng upload
+        False — file biến mất trong khi đợi
+    """
+    last_size = -1
+    stable_elapsed = 0
+    file_name = os.path.basename(file_path)
+    while stable_elapsed < stable_secs:
+        try:
+            current_size = os.path.getsize(file_path)
+        except OSError:
+            return False
+        if current_size == last_size:
+            stable_elapsed += poll_interval
+        else:
+            if last_size != -1:   # size đang thay đổi — chỉ log khi file đột ngột lớn hơn
+                log_print(f"⏳ File đang được ghi, đợi ổn định: {file_name} ({current_size/(1024**3):.2f} GB)")
+            stable_elapsed = 0
+            last_size = current_size
+        if stable_elapsed < stable_secs:
+            time.sleep(poll_interval)
+    return True
 
 
 # --- CẤU TRÚC CHÍNH ---
@@ -284,6 +313,12 @@ class GoogleDriveManager:
         thread_tag = f"[{threading.current_thread().name}] "
         try:
             file_name = os.path.basename(file_path)
+
+            # Kiểm tra file ổn định (chưa bị ghi dở) trước khi upload
+            if not _wait_for_stable_size(file_path):
+                log_print(f"{thread_tag}⚠️ File biến mất khi đợi: {file_name} — bỏ qua.")
+                return None
+
             file_size_bytes = os.path.getsize(file_path)
             file_size_mb = file_size_bytes / (1024 * 1024)
 
