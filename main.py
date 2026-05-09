@@ -31,6 +31,7 @@ def load_config():
         default_config = {
             "DRIVE_FOLDER_ID": "1Gxd4eejYA3o7Rwwd_W62rP8xBamhGpvW",
             "WATCH_FOLDERS": ["data-upload"],
+            "IGNORE_STARTUP_FILES": True,
             "MAX_UPLOAD_SPEED_MBPS": 0,
             "TELEGRAM_BOT_TOKEN": "",
             "TELEGRAM_CHAT_ID": "",
@@ -51,7 +52,8 @@ def load_config():
             "NOTIFY_SIZE_LIMIT_MB": 5,
             "DELETE_REMOTE_FILES": False,
             "SYNC_REMOTE_TO_LOCAL": False,
-            "WATCH_FOLDERS": ["data-upload"]
+            "WATCH_FOLDERS": ["data-upload"],
+            "IGNORE_STARTUP_FILES": True
         }
         updated = False
         
@@ -135,8 +137,24 @@ class GoogleDriveManager:
         self.parent_id = parent_folder_id
         self.service = self._get_service()
         self.md5_cache = {}
+        self.ignored_files_at_startup = {}
         if not os.path.exists(SESSION_DIR):
             os.makedirs(SESSION_DIR)
+
+    def scan_startup_files(self, root_folder_path):
+        if not CONFIG.get("IGNORE_STARTUP_FILES", True):
+            return
+        log_print(f"🔍 Đang quét và đánh dấu bỏ qua các file cũ trong: {root_folder_path}...")
+        ignore_patterns = load_ignore_patterns()
+        for dirpath, dirnames, filenames in os.walk(root_folder_path):
+            dirnames[:] = [d for d in dirnames if not is_ignored(os.path.join(dirpath, d), root_folder_path, ignore_patterns)]
+            for filename in filenames:
+                file_path = os.path.abspath(os.path.join(dirpath, filename))
+                if not is_ignored(file_path, root_folder_path, ignore_patterns):
+                    try:
+                        self.ignored_files_at_startup[file_path] = os.path.getmtime(file_path)
+                    except:
+                        pass
 
     def _get_service(self):
         creds = None
@@ -338,12 +356,19 @@ class GoogleDriveManager:
                     elif CONFIG.get("DELETE_REMOTE_FILES", True):
                         self.delete_file(drive_foldername, drive_folder_id)
                     
-            has_skipped_files = False
             for filename in filenames:
                 file_path = os.path.join(current_local_dir, filename)
                 if is_ignored(file_path, root_folder_path, ignore_patterns):
                     continue
                     
+                abs_path = os.path.abspath(file_path)
+                if CONFIG.get("IGNORE_STARTUP_FILES", True) and abs_path in self.ignored_files_at_startup:
+                    try:
+                        if os.path.getmtime(abs_path) <= self.ignored_files_at_startup[abs_path]:
+                            continue
+                    except:
+                        pass
+                        
                 local_md5 = self._calculate_md5(file_path)
                 if not local_md5:
                     has_skipped_files = True
@@ -378,16 +403,23 @@ class WatcherHandler(FileSystemEventHandler):
         self.folder_path = folder_path
         self.ignore_patterns = load_ignore_patterns()
         self.timer = None
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()          # Bảo vệ timer
+        self.sync_lock = threading.Lock()     # Bảo vệ execute_sync khỏi chạy song song
+        self.sync_pending = False             # Ghi nhận có thay đổi mới trong khi đang sync
 
     def on_modified(self, event):
+        if event.is_directory:
+            return
         if is_ignored(event.src_path, self.folder_path, self.ignore_patterns):
             return
         
         with self.lock:
+            if self.sync_lock.locked():
+                # Đang sync rồi → chỉ đánh dấu pending, không tạo thêm luồng
+                self.sync_pending = True
+                return
             if self.timer:
                 self.timer.cancel()
-            
             # Đợi 2 giây sau sự kiện cuối cùng mới bắt đầu đồng bộ
             self.timer = threading.Timer(2.0, self.execute_sync, [event.src_path])
             self.timer.start()
@@ -397,20 +429,23 @@ class WatcherHandler(FileSystemEventHandler):
     def on_moved(self, event): self.on_modified(event)
 
     def execute_sync(self, src_path):
-        log_print(f"\n👀 Phát hiện thay đổi tại: {os.path.basename(src_path)}")
-        log_print("⏳ Bắt đầu đồng bộ hàng loạt...")
-        
-        # Nếu có file bị skip (do đang copy), upload_directory trả về True
-        has_skipped = self.drive.upload_directory(self.folder_path)
-        
-        if has_skipped:
-            log_print("⚠️ Một số file đang bận (đang copy). Sẽ tự động quét lại sau 5 giây...")
-            with self.lock:
-                if self.timer: self.timer.cancel()
-                self.timer = threading.Timer(5.0, self.execute_sync, [src_path])
-                self.timer.start()
-        else:
-            log_print(f"\n👀 Tiếp tục theo dõi thư mục '{self.folder_path}'... (Bấm Ctrl+C để thoát)")
+        with self.sync_lock:
+            self.sync_pending = False
+            log_print(f"\n👀 Phát hiện thay đổi tại: {os.path.basename(src_path)}")
+            log_print("⏳ Bắt đầu đồng bộ hàng loạt...")
+            
+            # Nếu có file bị skip (do đang copy), upload_directory trả về True
+            has_skipped = self.drive.upload_directory(self.folder_path)
+            
+            if has_skipped or self.sync_pending:
+                reason = "Một số file đang bận (đang copy)" if has_skipped else "Có thay đổi mới trong lúc đồng bộ"
+                log_print(f"⚠️ {reason}. Sẽ tự động quét lại sau 5 giây...")
+                with self.lock:
+                    if self.timer: self.timer.cancel()
+                    self.timer = threading.Timer(5.0, self.execute_sync, [src_path])
+                    self.timer.start()
+            else:
+                log_print(f"\n👀 Tiếp tục theo dõi thư mục '{self.folder_path}'... (Bấm Ctrl+C để thoát)")
 
 
 def start_watching(drive_manager, folder_paths):
@@ -448,6 +483,10 @@ if __name__ == '__main__':
     for folder_to_watch in folders_to_watch:
         if not os.path.exists(folder_to_watch):
             os.makedirs(folder_to_watch)
-        drive.upload_directory(folder_to_watch)
+            
+        if CONFIG.get("IGNORE_STARTUP_FILES", True):
+            drive.scan_startup_files(folder_to_watch)
+        else:
+            drive.upload_directory(folder_to_watch)
         
     start_watching(drive, folders_to_watch)

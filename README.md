@@ -14,6 +14,7 @@ Một công cụ mạnh mẽ và chuyên nghiệp để đồng bộ hóa dữ l
 - **Giới hạn băng thông**: Kiểm soát tốc độ tải lên để không làm ảnh hưởng đến các công việc khác.
 - **Thông báo Telegram**: Nhận thông báo ngay lập tức qua bot Telegram khi các tệp tin lớn được tải lên thành công.
 - **Hệ thống Ignore**: Loại bỏ các file/thư mục không cần thiết (như `.git`, `node_modules`, `tmp`) thông qua file `.syncignore`.
+- **Tối ưu Khởi động**: Bỏ qua quá trình quét toàn bộ file cũ lúc khởi động, chỉ bắt đầu đồng bộ những file mới hoặc file bị thay đổi (tùy chỉnh qua `IGNORE_STARTUP_FILES`).
 
 ## 🛠 Yêu cầu hệ thống
 
@@ -57,6 +58,7 @@ File `config.json` sẽ được tự động tạo khi bạn chạy bot lần �
 | `NOTIFY_SIZE_LIMIT_MB` | Chỉ gửi thông báo Telegram cho các file có dung lượng lớn hơn mức này. |
 | `DELETE_REMOTE_FILES` | `true`: Xóa file trên Drive nếu máy cục bộ xóa. `false`: Luôn giữ file trên Drive. |
 | `SYNC_REMOTE_TO_LOCAL` | `true`: Tải file từ Drive về máy nếu máy bị thiếu. |
+| `IGNORE_STARTUP_FILES` | `true`: Bỏ qua các file hiện có khi khởi động, chỉ đồng bộ file mới hoặc bị thay đổi sau khi bật Bot. `false`: Quét và đồng bộ lại toàn bộ. |
 
 ## 📂 Quản lý tệp bỏ qua (`.syncignore`)
 
@@ -80,7 +82,7 @@ python main.py
 ```
 
 - Trong lần đầu chạy, một cửa sổ trình duyệt sẽ hiện ra để bạn xác thực tài khoản Google.
-- Sau khi xác thực, bot sẽ quét toàn bộ thư mục một lần để đồng bộ (Initial Sync).
+- Tùy vào cấu hình `IGNORE_STARTUP_FILES`: nếu `true`, bot sẽ đánh dấu và bỏ qua các file cũ; nếu `false`, bot sẽ quét và đồng bộ lại toàn bộ thư mục (Initial Sync).
 - Sau đó, bot sẽ chạy ngầm và theo dõi mọi thay đổi để đồng bộ tức thì.
 - Bấm `Ctrl + C` để dừng bot an toàn.
 
