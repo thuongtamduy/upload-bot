@@ -2,13 +2,15 @@ import os
 import io
 import hashlib
 import time
-import sys
 import signal
 import json
 import logging
 import fnmatch
+import threading
+import queue
 import urllib.request
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from google.auth.transport.requests import Request
@@ -18,6 +20,12 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 
+# --- CONSTANTS ---
+LARGE_FILE_THRESHOLD_BYTES = 100 * 1024 * 1024   # 100 MB: dùng resumable chunk lớn
+LARGE_FILE_CHUNK_SIZE      = 100 * 1024 * 1024   # 100 MB per chunk (tối ưu cho file .sql lớn)
+SMALL_FILE_CHUNK_SIZE      =   1 * 1024 * 1024   # 1  MB per chunk (tiến độ mượt hơn)
+MD5_READ_CHUNK             =  64 * 1024           # 64 KB — cân bằng giữa tốc độ và bộ nhớ
+
 CONFIG_FILE = "config.json"
 IGNORE_FILE = ".syncignore"
 SESSION_DIR = ".upload_sessions"
@@ -25,52 +33,49 @@ LOG_FILE = "history.log"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = "credentials.json"
 
+# Nguồn sự thật duy nhất cho tất cả các key config và giá trị mặc định.
+# Thêm key mới vào đây là đủ — load_config() sẽ tự lo phần còn lại.
+CONFIG_DEFAULTS = {
+    "DRIVE_FOLDER_ID":       "1Gxd4eejYA3o7Rwwd_W62rP8xBamhGpvW",
+    "WATCH_FOLDERS":         ["data-upload"],
+    "IGNORE_STARTUP_FILES":  True,
+    "MAX_UPLOAD_SPEED_MBPS": 0,
+    "TELEGRAM_BOT_TOKEN":    "",
+    "TELEGRAM_CHAT_ID":      "",
+    "NOTIFY_SIZE_LIMIT_MB":  5,
+    "DELETE_REMOTE_FILES":   False,
+    "SYNC_REMOTE_TO_LOCAL":  False,
+    "ENABLE_PARALLEL":       True,
+    "MAX_WORKERS":           5,
+}
+
 
 # --- 4. HỆ THỐNG CONFIG ---
 def load_config():
+    # -- Tạo file mới nếu chưa tồn tại --
     if not os.path.exists(CONFIG_FILE):
-        default_config = {
-            "DRIVE_FOLDER_ID": "1Gxd4eejYA3o7Rwwd_W62rP8xBamhGpvW",
-            "WATCH_FOLDERS": ["data-upload"],
-            "IGNORE_STARTUP_FILES": True,
-            "MAX_UPLOAD_SPEED_MBPS": 0,
-            "TELEGRAM_BOT_TOKEN": "",
-            "TELEGRAM_CHAT_ID": "",
-            "NOTIFY_SIZE_LIMIT_MB": 5,
-            "DELETE_REMOTE_FILES": False,
-            "SYNC_REMOTE_TO_LOCAL": False,
-        }
         with open(CONFIG_FILE, "w") as f:
-            json.dump(default_config, f, indent=4)
-        return default_config
-    with open(CONFIG_FILE, "r") as f:
-        # Tự động cập nhật thêm key mới nếu config cũ chưa có
-        cfg = json.load(f)
-        defaults = {
-            "MAX_UPLOAD_SPEED_MBPS": 0,
-            "TELEGRAM_BOT_TOKEN": "",
-            "TELEGRAM_CHAT_ID": "",
-            "NOTIFY_SIZE_LIMIT_MB": 5,
-            "DELETE_REMOTE_FILES": False,
-            "SYNC_REMOTE_TO_LOCAL": False,
-            "WATCH_FOLDERS": ["data-upload"],
-            "IGNORE_STARTUP_FILES": True,
-        }
-        updated = False
+            json.dump(CONFIG_DEFAULTS, f, indent=4)
+        return dict(CONFIG_DEFAULTS)   # trả về bản sao để tránh mutate
 
-        # Migrate cũ sang mới
-        if "WATCH_FOLDER" in cfg:
-            cfg["WATCH_FOLDERS"] = [cfg.pop("WATCH_FOLDER")]
+    # -- Đọc file hiện có --
+    with open(CONFIG_FILE, "r") as f:
+        cfg = json.load(f)
+
+    updated = False
+
+    # Điền các key còn thiếu từ CONFIG_DEFAULTS
+    for key, default_val in CONFIG_DEFAULTS.items():
+        if key not in cfg:
+            cfg[key] = default_val
             updated = True
 
-        for k, v in defaults.items():
-            if k not in cfg:
-                cfg[k] = v
-                updated = True
-        if updated:
-            with open(CONFIG_FILE, "w") as f2:
-                json.dump(cfg, f2, indent=4)
-        return cfg
+    # Ghi lại nếu có thay đổi
+    if updated:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=4)
+
+    return cfg
 
 
 CONFIG = load_config()
@@ -98,7 +103,7 @@ def log_print(msg, is_progress=False):
         # Bỏ các emoji khi ghi vào log cho sạch
         clean_msg = msg.encode("ascii", "ignore").decode("ascii").strip()
         if clean_msg:
-            logger.info(msg)
+            logger.info(clean_msg)   # ghi clean_msg, không phải msg gốc
 
 
 # --- TELEGRAM BOT ---
@@ -176,7 +181,7 @@ class GoogleDriveManager:
                         self.ignored_files_at_startup[file_path] = os.path.getmtime(
                             file_path
                         )
-                    except:
+                    except OSError:
                         pass
 
     def _get_service(self):
@@ -193,6 +198,14 @@ class GoogleDriveManager:
                 creds = flow.run_local_server(port=0)
             with open("token.json", "w") as token:
                 token.write(creds.to_json())
+        return build("drive", "v3", credentials=creds)
+
+    @staticmethod
+    def _build_service():
+        """Tạo service Google Drive độc lập — dùng cho worker threads (thread-safe)."""
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         return build("drive", "v3", credentials=creds)
 
     def _create_drive_folder(self, folder_name, parent_id):
@@ -250,7 +263,7 @@ class GoogleDriveManager:
                 return self.md5_cache[file_path]["md5"]
             hash_md5 = hashlib.md5()
             with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(4096), b""):
+                for chunk in iter(lambda: f.read(MD5_READ_CHUNK), b""):
                     hash_md5.update(chunk)
             computed_md5 = hash_md5.hexdigest()
             self.md5_cache[file_path] = {"mtime": mtime, "md5": computed_md5}
@@ -264,12 +277,23 @@ class GoogleDriveManager:
             return None
 
     # --- 3. TRUE RESUME UPLOAD ---
-    def upload_file(self, file_path, existing_file_id=None, parent_id=None):
+    def upload_file(self, file_path, existing_file_id=None, parent_id=None, service=None):
+        """Upload một file lên Drive. Truyền `service` riêng khi gọi từ worker thread."""
         parent_id = parent_id or self.parent_id
+        svc = service or self.service          # dùng service truyền vào nếu có
+        thread_tag = f"[{threading.current_thread().name}] "
         try:
             file_name = os.path.basename(file_path)
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            chunk_size = 1 * 1024 * 1024  # Giảm xuống 1MB để thấy tiến độ mượt hơn
+            file_size_bytes = os.path.getsize(file_path)
+            file_size_mb = file_size_bytes / (1024 * 1024)
+
+            # Tối ưu chunk size theo kích thước file
+            if file_size_bytes >= LARGE_FILE_THRESHOLD_BYTES:
+                chunk_size = LARGE_FILE_CHUNK_SIZE
+                log_print(f"{thread_tag}📦 File lớn ({file_size_mb:.0f} MB) — dùng chunk 100 MB: {file_name}")
+            else:
+                chunk_size = SMALL_FILE_CHUNK_SIZE
+
             media = MediaFileUpload(file_path, chunksize=chunk_size, resumable=True)
 
             file_md5 = self._calculate_md5(file_path)
@@ -284,14 +308,14 @@ class GoogleDriveManager:
 
             if existing_file_id:
                 if not saved_uri:
-                    log_print(f"🔄 Đang cập nhật thay đổi: {file_name}...")
-                request = self.service.files().update(
+                    log_print(f"{thread_tag}🔄 Đang cập nhật thay đổi: {file_name}...")
+                request = svc.files().update(
                     fileId=existing_file_id, media_body=media, fields="id"
                 )
             else:
                 if not saved_uri:
-                    log_print(f"⬆️ Đang tải lên file mới: {file_name}...")
-                request = self.service.files().create(
+                    log_print(f"{thread_tag}⬆️ Đang tải lên file mới: {file_name}...")
+                request = svc.files().create(
                     body={"name": file_name, "parents": [parent_id]},
                     media_body=media,
                     fields="id",
@@ -345,11 +369,13 @@ class GoogleDriveManager:
                         if session_file and os.path.exists(session_file):
                             os.remove(session_file)
                         log_print(
-                            f"\n⚠️ Phiên tải lên cũ đã hết hạn. Đang tải lại từ đầu..."
+                            f"\n⚠️ {thread_tag}Phiên tải lên cũ đã hết hạn. Đang tải lại từ đầu..."
                         )
-                        return self.upload_file(file_path, existing_file_id, parent_id)
+                        # Truyền lại service để không mất thread-safety
+                        return self.upload_file(file_path, existing_file_id, parent_id, service)
                     else:
-                        raise e
+                        raise
+
 
             # Luôn hiển thị 100% khi kết thúc để người dùng yên tâm
             log_print(
@@ -408,7 +434,17 @@ class GoogleDriveManager:
             log_print(f"\n❌ Tải xuống thất bại: {e}\n")
             return False
 
-    def upload_directory(self, root_folder_path):
+    def upload_directory(self, root_folder_path, upload_fn=None):
+        """
+        Quét cây thư mục và đồng bộ lên Drive.
+
+        Args:
+            upload_fn: Hàm gọi khi cần upload một file.
+                       Signature: upload_fn(file_path, existing_file_id=None, parent_id=None)
+                       Mặc định: self.upload_file  (chế độ tuần tự)
+                       Truyền queue_manager.enqueue  (chế độ song song)
+        """
+        _upload = upload_fn or self.upload_file
         if not os.path.exists(root_folder_path):
             log_print(f"❌ Thư mục '{root_folder_path}' không tồn tại!")
             return False
@@ -475,7 +511,7 @@ class GoogleDriveManager:
                             <= self.ignored_files_at_startup[abs_path]
                         ):
                             continue
-                    except:
+                    except OSError:
                         pass
 
                 local_md5 = self._calculate_md5(file_path)
@@ -485,10 +521,10 @@ class GoogleDriveManager:
 
                 drive_file = drive_files.get(filename)
                 if not drive_file:
-                    self.upload_file(file_path, parent_id=current_drive_parent_id)
+                    _upload(file_path, parent_id=current_drive_parent_id)
                 else:
                     if local_md5 != drive_file["md5"]:
-                        self.upload_file(
+                        _upload(
                             file_path,
                             existing_file_id=drive_file["id"],
                             parent_id=current_drive_parent_id,
@@ -520,18 +556,114 @@ class GoogleDriveManager:
         return has_skipped_files
 
 
-import threading
+# ---------------------------------------------------------------------------
+# UPLOAD QUEUE MANAGER — hàng đợi + ThreadPoolExecutor
+# ---------------------------------------------------------------------------
+
+
+class UploadQueueManager:
+    """
+    Quản lý upload song song qua Queue + ThreadPoolExecutor.
+
+    Luồng dữ liệu:
+        enqueue(file_path) → queue.Queue
+            ↓ (dispatcher thread)
+        ThreadPoolExecutor.submit(_worker)
+            ↓ (worker thread — có service riêng, thread-safe)
+        drive_manager.upload_file(service=<riêng>)
+            ↓
+        send_telegram_notify()
+    """
+
+    def __init__(self, drive_manager: "GoogleDriveManager", max_workers: int = 5):
+        self.drive        = drive_manager
+        self._queue       = queue.Queue()
+        self._in_progress = set()          # tránh enqueue trùng file
+        self._lock        = threading.Lock()
+        self._executor    = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="Uploader",
+        )
+        self._stopped = False
+        # Dispatcher chạy ngầm, lấy item từ queue rồi submit vào executor
+        self._dispatcher_thread = threading.Thread(
+            target=self._dispatcher, name="UploadDispatcher", daemon=True
+        )
+        self._dispatcher_thread.start()
+        log_print(f"🚀 UploadQueueManager khởi động — {max_workers} workers song song.")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def enqueue(self, file_path: str, existing_file_id: str = None, parent_id: str = None):
+        """Đẩy một file vào hàng đợi. Bỏ qua nếu file đang được xử lý."""
+        abs_path = os.path.abspath(file_path)
+        with self._lock:
+            if abs_path in self._in_progress:
+                log_print(f"⏭️  Bỏ qua (đang upload): {os.path.basename(abs_path)}")
+                return
+            self._in_progress.add(abs_path)
+        self._queue.put((abs_path, existing_file_id, parent_id))
+        log_print(f"📥 Đã thêm vào hàng đợi: {os.path.basename(abs_path)} "
+                  f"(queue size: {self._queue.qsize()})")
+
+    def shutdown(self, wait: bool = True):
+        """Dừng dispatcher và chờ tất cả worker hoàn thành."""
+        self._stopped = True
+        self._queue.put(None)          # sentinel để thoát dispatcher
+        self._executor.shutdown(wait=wait)
+        log_print("🛑 UploadQueueManager đã dừng.")
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _dispatcher(self):
+        """Thread ngầm: lấy item từ queue và submit vào ThreadPoolExecutor."""
+        while not self._stopped:
+            item = self._queue.get()
+            if item is None:           # sentinel — thoát
+                break
+            file_path, existing_file_id, parent_id = item
+            self._executor.submit(self._worker, file_path, existing_file_id, parent_id)
+
+    def _worker(self, file_path: str, existing_file_id: str, parent_id: str):
+        """
+        Worker chạy trong thread riêng:
+        - Tạo service Google Drive độc lập (thread-safe)
+        - Upload file
+        - Gửi Telegram notify nếu thành công
+        - Bắt mọi exception — KHÔNG để lỗi 1 file ảnh hưởng file khác
+        """
+        file_name = os.path.basename(file_path)
+        try:
+            # Mỗi worker tạo service riêng → thread-safe hoàn toàn
+            svc = GoogleDriveManager._build_service()
+            self.drive.upload_file(
+                file_path,
+                existing_file_id=existing_file_id,
+                parent_id=parent_id,
+                service=svc,
+            )
+        except Exception as e:
+            log_print(f"\n❌ [Worker] Lỗi upload '{file_name}': {e}\n")
+        finally:
+            # Luôn xóa khỏi in_progress dù thành công hay thất bại
+            with self._lock:
+                self._in_progress.discard(os.path.abspath(file_path))
 
 
 class WatcherHandler(FileSystemEventHandler):
-    def __init__(self, drive_manager, folder_path):
+    def __init__(self, drive_manager, folder_path, queue_manager=None):
         self.drive = drive_manager
         self.folder_path = folder_path
+        self.queue_manager = queue_manager          # None → chế độ tuần tự
         self.ignore_patterns = load_ignore_patterns()
         self.timer = None
-        self.lock = threading.Lock()  # Bảo vệ timer
-        self.sync_lock = threading.Lock()  # Bảo vệ execute_sync khỏi chạy song song
-        self.sync_pending = False  # Ghi nhận có thay đổi mới trong khi đang sync
+        self.lock = threading.Lock()                # bảo vệ timer
+        self.sync_lock = threading.Lock()           # chỉ dùng ở chế độ tuần tự
+        self.sync_pending = False
 
     def on_modified(self, event):
         if event.is_directory:
@@ -540,13 +672,13 @@ class WatcherHandler(FileSystemEventHandler):
             return
 
         with self.lock:
-            if self.sync_lock.locked():
-                # Đang sync rồi → chỉ đánh dấu pending, không tạo thêm luồng
+            # Chế độ tuần tự: nếu đang sync thì chỉ đánh dấu pending
+            if self.queue_manager is None and self.sync_lock.locked():
                 self.sync_pending = True
                 return
             if self.timer:
                 self.timer.cancel()
-            # Đợi 2 giây sau sự kiện cuối cùng mới bắt đầu đồng bộ
+            # Debounce 2 giây sau sự kiện cuối cùng mới bắt đầu
             self.timer = threading.Timer(2.0, self.execute_sync, [event.src_path])
             self.timer.start()
 
@@ -560,52 +692,75 @@ class WatcherHandler(FileSystemEventHandler):
         self.on_modified(event)
 
     def execute_sync(self, src_path):
-        with self.sync_lock:
-            self.sync_pending = False
-            log_print(f"\n👀 Phát hiện thay đổi tại: {os.path.basename(src_path)}")
-            log_print("⏳ Bắt đầu đồng bộ hàng loạt...")
+        log_print(f"\n👀 Phát hiện thay đổi tại: {os.path.basename(src_path)}")
 
-            # Nếu có file bị skip (do đang copy), upload_directory trả về True
-            has_skipped = self.drive.upload_directory(self.folder_path)
+        if self.queue_manager is not None:
+            # ----------------------------------------------------------------
+            # CHẾ ĐỘ SONG SONG: scan + enqueue, không block Watchdog thread
+            # ----------------------------------------------------------------
+            log_print("⚡ Chế độ song song: đang quét và đưa vào hàng đợi...")
+            self.drive.upload_directory(
+                self.folder_path,
+                upload_fn=self.queue_manager.enqueue,
+            )
+            log_print(
+                f"\n👀 Tiếp tục theo dõi thư mục '{self.folder_path}'... (Bấm Ctrl+C để thoát)"
+            )
+        else:
+            # ----------------------------------------------------------------
+            # CHẾ ĐỘ TUẦN TỰ: giữ nguyên logic cũ
+            # ----------------------------------------------------------------
+            with self.sync_lock:
+                self.sync_pending = False
+                log_print("⏳ Bắt đầu đồng bộ hàng loạt...")
+                has_skipped = self.drive.upload_directory(self.folder_path)
 
-            if has_skipped or self.sync_pending:
-                reason = (
-                    "Một số file đang bận (đang copy)"
-                    if has_skipped
-                    else "Có thay đổi mới trong lúc đồng bộ"
-                )
-                log_print(f"⚠️ {reason}. Sẽ tự động quét lại sau 5 giây...")
-                with self.lock:
-                    if self.timer:
-                        self.timer.cancel()
-                    self.timer = threading.Timer(5.0, self.execute_sync, [src_path])
-                    self.timer.start()
-            else:
-                log_print(
-                    f"\n👀 Tiếp tục theo dõi thư mục '{self.folder_path}'... (Bấm Ctrl+C để thoát)"
-                )
+                if has_skipped or self.sync_pending:
+                    reason = (
+                        "Một số file đang bận (đang copy)"
+                        if has_skipped
+                        else "Có thay đổi mới trong lúc đồng bộ"
+                    )
+                    log_print(f"⚠️ {reason}. Sẽ tự động quét lại sau 5 giây...")
+                    with self.lock:
+                        if self.timer:
+                            self.timer.cancel()
+                        self.timer = threading.Timer(5.0, self.execute_sync, [src_path])
+                        self.timer.start()
+                else:
+                    log_print(
+                        f"\n👀 Tiếp tục theo dõi thư mục '{self.folder_path}'... (Bấm Ctrl+C để thoát)"
+                    )
 
 
-def start_watching(drive_manager, folder_paths):
+def start_watching(drive_manager, folder_paths, queue_manager=None):
     observer = Observer()
     for folder_path in folder_paths:
-        event_handler = WatcherHandler(drive_manager, folder_path)
+        event_handler = WatcherHandler(drive_manager, folder_path, queue_manager=queue_manager)
         observer.schedule(event_handler, folder_path, recursive=True)
         log_print(f"\n👀 Đang theo dõi thư mục '{folder_path}'...")
 
-    log_print(f"\n🚀 Tool đang chạy ngầm... (Bấm Ctrl+C để thoát)")
+    mode = "⚡ Song song" if queue_manager else "📼 Tuần tự"
+    log_print(f"\n🚀 Tool đang chạy ngầm [{mode}]... (Bấm Ctrl+C để thoát)")
     observer.start()
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         pass
-    observer.join()
-
+    finally:
+        observer.stop()
+        observer.join()
+        if queue_manager:
+            log_print("\n⏳ Đang chờ các upload đang dở hoàn thành...")
+            queue_manager.shutdown(wait=True)
 
 def signal_handler(sig, frame):
-    log_print("\n\n🛑 Đang dừng mọi tiến trình và tắt Tool an toàn... Hẹn gặp lại!")
-    os._exit(0)
+    """Ctrl+C: raise KeyboardInterrupt thông thường để finally trong start_watching chạy."""
+    log_print("\n\n🛑 Đang dừng bot, đợi upload dở hoàn tất... (bấm Ctrl+C lần 2 để thoát ngậy)")
+    # Không dùng os._exit() — phải để finally trong start_watching gọi queue_manager.shutdown()
+    signal.signal(sig, signal.SIG_DFL)  # lần 2 bấm Ctrl+C sẽ thoát ngậy
+    raise KeyboardInterrupt
 
 
 if __name__ == "__main__":
@@ -632,6 +787,12 @@ if __name__ == "__main__":
 
     drive = GoogleDriveManager(FOLDER_ID)
 
+    # Khởi tạo UploadQueueManager nếu được bật
+    queue_manager = None
+    if CONFIG.get("ENABLE_PARALLEL", True):
+        max_workers = int(CONFIG.get("MAX_WORKERS", 5))
+        queue_manager = UploadQueueManager(drive, max_workers=max_workers)
+
     for folder_to_watch in folders_to_watch:
         if not os.path.exists(folder_to_watch):
             os.makedirs(folder_to_watch)
@@ -641,4 +802,4 @@ if __name__ == "__main__":
         else:
             drive.upload_directory(folder_to_watch)
 
-    start_watching(drive, folders_to_watch)
+    start_watching(drive, folders_to_watch, queue_manager=queue_manager)

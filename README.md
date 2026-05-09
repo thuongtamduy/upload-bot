@@ -1,10 +1,12 @@
 # Google Drive Sync Bot 🚀
 > Phát triển bởi **thuongtamduy** ([thuongtamduy.com](https://thuongtamduy.com))
 
-Một công cụ mạnh mẽ và chuyên nghiệp để đồng bộ hóa dữ liệu thời gian thực giữa máy tính của bạn và Google Drive. Bot được thiết kế để hoạt động ổn định, hỗ trợ tải lên các tệp tin lớn, quản lý băng thông và thông báo qua Telegram.
+Một công cụ mạnh mẽ và chuyên nghiệp để đồng bộ hóa dữ liệu thời gian thực giữa máy tính của bạn và Google Drive. Bot được thiết kế để hoạt động ổn định, hỗ trợ **upload song song** nhiều file cùng lúc, tối ưu cho các tệp tin lớn (15GB+), quản lý băng thông và thông báo qua Telegram.
 
 ## ✨ Tính năng nổi bật
 
+- **Upload Song Song (Parallel)**: Tải lên nhiều file cùng lúc với `ThreadPoolExecutor`. Cấu hình số lượng worker tùy ý. Watchdog không bị block trong khi upload đang chạy ngầm.
+- **Tối ưu cho file lớn**: Tự động dùng chunk 100 MB khi file ≥ 100 MB, giúp tốc độ tải lên đạt ~20+ MB/s và hỗ trợ resume nếu bị ngắt.
 - **Đồng bộ thời gian thực**: Tự động phát hiện thay đổi (thêm, sửa, xóa, đổi tên) và cập nhật lên Google Drive ngay lập tức.
 - **True Resume Upload**: Hỗ trợ khôi phục phiên tải lên khi bị ngắt quãng (mất mạng, tắt máy), cực kỳ hữu ích cho các tệp tin hàng GB.
 - **Đồng bộ hai chiều tùy chỉnh**:
@@ -51,7 +53,9 @@ File `config.json` sẽ được tự động tạo khi bạn chạy bot lần �
 | Tham số | Mô tả |
 | :--- | :--- |
 | `DRIVE_FOLDER_ID` | ID của thư mục trên Google Drive mà bạn muốn đồng bộ vào. |
-| `WATCH_FOLDERS` | Danh sách (mảng) các đường dẫn thư mục trên máy tính cần theo dõi (có thể dùng đường dẫn tuyệt đối). VD: `["thu-muc-1", "D:/thu-muc-2"]` |
+| `WATCH_FOLDERS` | Danh sách (mảng) các đường dẫn thư mục trên máy tính cần theo dõi. VD: `["thu-muc-1", "D:/thu-muc-2"]` |
+| `ENABLE_PARALLEL` | `true`: Bật upload song song (nhiều file cùng lúc). `false`: Upload tuần tự như cũ. |
+| `MAX_WORKERS` | Số lượng file được upload đồng thời (chỉ có hiệu lực khi `ENABLE_PARALLEL: true`). Mặc định `5`. |
 | `MAX_UPLOAD_SPEED_MBPS` | Giới hạn tốc độ tải lên (MB/s). Đặt `0` để không giới hạn. |
 | `TELEGRAM_BOT_TOKEN` | Token của bot Telegram (nếu muốn nhận thông báo). |
 | `TELEGRAM_CHAT_ID` | ID chat Telegram của bạn. |
