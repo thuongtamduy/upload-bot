@@ -379,6 +379,7 @@ class GoogleDriveManager:
                     first_chunk = True
                     max_speed_mb = float(CONFIG.get("MAX_UPLOAD_SPEED_MBPS", 0))
 
+                    last_progress_mb = 0
                     while response is None:
                         chunk_start = time.time()
                         status, response = request.next_chunk()
@@ -389,6 +390,7 @@ class GoogleDriveManager:
                             first_chunk = False
 
                         if status:
+                            last_progress_mb = status.resumable_progress / (1024 * 1024)
                             chunk_elapsed = time.time() - chunk_start
                             if max_speed_mb > 0:
                                 expected_time = (chunk_size / (1024 * 1024)) / max_speed_mb
@@ -417,14 +419,18 @@ class GoogleDriveManager:
                 except RETRYABLE_NETWORK_ERRORS as e:
                     if attempt < len(RETRY_DELAYS):
                         delay = RETRY_DELAYS[attempt]
-                        log_print(f"\n⚠️ {thread_tag}Lỗi mạng ({e.__class__.__name__}): {file_name}. Thử lại sau {delay}s (lần {attempt+1})...")
+                        prog_info = f" [Đã up: {last_progress_mb:.1f}/{file_size_mb:.1f} MB]" if 'last_progress_mb' in locals() and last_progress_mb > 0 else ""
+                        log_print(f"\n⚠️ {thread_tag}Lỗi mạng ({e.__class__.__name__}): {file_name}{prog_info}. Thử lại sau {delay}s (lần {attempt+1}/{len(RETRY_DELAYS)})...")
                         time.sleep(delay)
                     else:
+                        if session_file and os.path.exists(session_file):
+                            os.remove(session_file)
                         raise e
                 except HttpError as e:
                     if e.resp.status in [500, 502, 503, 504] and attempt < len(RETRY_DELAYS):
                         delay = RETRY_DELAYS[attempt]
-                        log_print(f"\n⚠️ {thread_tag}Lỗi server Google ({e.resp.status}): {file_name}. Thử lại sau {delay}s (lần {attempt+1})...")
+                        prog_info = f" [Đã up: {last_progress_mb:.1f}/{file_size_mb:.1f} MB]" if 'last_progress_mb' in locals() and last_progress_mb > 0 else ""
+                        log_print(f"\n⚠️ {thread_tag}Lỗi server Google ({e.resp.status}): {file_name}{prog_info}. Thử lại sau {delay}s (lần {attempt+1}/{len(RETRY_DELAYS)})...")
                         time.sleep(delay)
                     elif e.resp.status in [404, 401, 403, 400]:
                         if session_file and os.path.exists(session_file):
@@ -435,6 +441,8 @@ class GoogleDriveManager:
                         # Truyền lại service để không mất thread-safety
                         return self.upload_file(file_path, existing_file_id, parent_id, service)
                     else:
+                        if attempt == len(RETRY_DELAYS) and session_file and os.path.exists(session_file):
+                            os.remove(session_file)
                         raise e
 
             # Luôn hiển thị 100% khi kết thúc để người dùng yên tâm
