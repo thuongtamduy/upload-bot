@@ -322,12 +322,13 @@ class GoogleDriveManager:
     def upload_directory(self, root_folder_path):
         if not os.path.exists(root_folder_path):
             log_print(f"❌ Thư mục '{root_folder_path}' không tồn tại!")
-            return
+            return False
             
         log_print(f"\n🔍 Bắt đầu đồng bộ cây thư mục từ: {root_folder_path}")
         folder_id_map = {os.path.abspath(root_folder_path): self.parent_id}
         ignore_patterns = load_ignore_patterns()
         
+        has_skipped_files = False
         for dirpath, dirnames, filenames in os.walk(root_folder_path):
             dirnames[:] = [d for d in dirnames if not is_ignored(os.path.join(dirpath, d), root_folder_path, ignore_patterns)]
             
@@ -471,11 +472,21 @@ def signal_handler(sig, frame):
 if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
     
+    # Kiểm tra credentials.json trước khi làm bất cứ điều gì
+    if not os.path.exists(CREDENTIALS_FILE):
+        log_print(f"❌ Không tìm thấy file '{CREDENTIALS_FILE}'.")
+        log_print("   Vui lòng tải credentials.json từ Google Cloud Console và đặt vào thư mục gốc.")
+        os._exit(1)
+
     FOLDER_ID = CONFIG.get("DRIVE_FOLDER_ID")
     folders_to_watch = CONFIG.get("WATCH_FOLDERS", [])
 
     if not folders_to_watch:
         log_print("❌ Không có thư mục nào để theo dõi trong WATCH_FOLDERS!")
+        os._exit(1)
+
+    if not FOLDER_ID:
+        log_print("❌ Chưa cấu hình DRIVE_FOLDER_ID trong config.json!")
         os._exit(1)
 
     drive = GoogleDriveManager(FOLDER_ID)

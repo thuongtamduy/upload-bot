@@ -32,6 +32,15 @@ if [ "$choice" == "2" ]; then
     PLIST_SRC="$SCRIPT_DIR/com.user.googledrivesync.plist"
     PLIST_DEST="$HOME/Library/LaunchAgents/com.user.googledrivesync.plist"
 
+    # Cảnh báo: nếu chưa xác thực Google thì LaunchAgent sẽ crash vì không có browser
+    if [ ! -f "token.json" ]; then
+        echo ""
+        echo "⚠️  CẢNH BÁO: Chưa có file 'token.json'."
+        echo "   Bạn cần chạy bot trực tiếp ít nhất 1 lần (chọn [1]) để hoàn thành xác thực Google."
+        echo "   Sau đó mới có thể cài đặt chạy ngầm."
+        exit 1
+    fi
+
     # Gỡ service cũ nếu đang chạy để tránh conflict
     launchctl unload "$PLIST_DEST" 2>/dev/null
 
