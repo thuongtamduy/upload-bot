@@ -26,6 +26,16 @@ LARGE_FILE_CHUNK_SIZE      = 100 * 1024 * 1024   # 100 MB per chunk (tối ưu c
 SMALL_FILE_CHUNK_SIZE      =   1 * 1024 * 1024   # 1  MB per chunk (tiến độ mượt hơn)
 MD5_READ_CHUNK             =  64 * 1024           # 64 KB — cân bằng giữa tốc độ và bộ nhớ
 
+# Retry khi gặp lỗi mạng: backoff tăng dần (giây)
+RETRY_DELAYS = [10, 30, 60, 120, 300]             # tối đa 5 lần thử lại
+RETRYABLE_NETWORK_ERRORS = (
+    BrokenPipeError,
+    ConnectionError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    TimeoutError,
+)
+
 CONFIG_FILE = "config.json"
 IGNORE_FILE = ".syncignore"
 SESSION_DIR = ".upload_sessions"
@@ -329,78 +339,94 @@ class GoogleDriveManager:
             else:
                 chunk_size = SMALL_FILE_CHUNK_SIZE
 
-            media = MediaFileUpload(file_path, chunksize=chunk_size, resumable=True)
-
             file_md5 = self._calculate_md5(file_path)
             session_file = (
                 os.path.join(SESSION_DIR, f"{file_md5}.json") if file_md5 else None
             )
-            saved_uri = None
 
-            if session_file and os.path.exists(session_file):
-                with open(session_file, "r") as f:
-                    saved_uri = json.load(f).get("uri")
-
-            if existing_file_id:
-                if not saved_uri:
-                    log_print(f"{thread_tag}🔄 Đang cập nhật thay đổi: {file_name}...")
-                request = svc.files().update(
-                    fileId=existing_file_id, media_body=media, fields="id"
-                )
-            else:
-                if not saved_uri:
-                    log_print(f"{thread_tag}⬆️ Đang tải lên file mới: {file_name}...")
-                request = svc.files().create(
-                    body={"name": file_name, "parents": [parent_id]},
-                    media_body=media,
-                    fields="id",
-                    supportsAllDrives=True,
-                )
-
-            if saved_uri:
-                log_print(f"⚡ Khôi phục phiên tải lên dang dở của: {file_name}...")
-                request.resumable_uri = saved_uri
-                request.resumable_progress = 0
-
-            response = None
-            start_time = time.time()
-            first_chunk = True
-            max_speed_mb = float(CONFIG.get("MAX_UPLOAD_SPEED_MBPS", 0))
-
-            while response is None:
+            for attempt in range(len(RETRY_DELAYS) + 1):
                 try:
-                    chunk_start = time.time()
-                    status, response = request.next_chunk()
+                    media = MediaFileUpload(file_path, chunksize=chunk_size, resumable=True)
+                    saved_uri = None
 
-                    if first_chunk and session_file and request.resumable_uri:
-                        with open(session_file, "w") as f:
-                            json.dump({"uri": request.resumable_uri}, f)
-                        first_chunk = False
+                    if session_file and os.path.exists(session_file):
+                        with open(session_file, "r") as f:
+                            saved_uri = json.load(f).get("uri")
 
-                    if status:
-                        chunk_elapsed = time.time() - chunk_start
-                        if max_speed_mb > 0:
-                            expected_time = (chunk_size / (1024 * 1024)) / max_speed_mb
-                            if chunk_elapsed < expected_time:
-                                time.sleep(expected_time - chunk_elapsed)
+                    if existing_file_id:
+                        if not saved_uri:
+                            log_print(f"{thread_tag}🔄 Đang cập nhật thay đổi: {file_name}...")
+                        request = svc.files().update(
+                            fileId=existing_file_id, media_body=media, fields="id"
+                        )
+                    else:
+                        if not saved_uri:
+                            log_print(f"{thread_tag}⬆️ Đang tải lên file mới: {file_name}...")
+                        request = svc.files().create(
+                            body={"name": file_name, "parents": [parent_id]},
+                            media_body=media,
+                            fields="id",
+                            supportsAllDrives=True,
+                        )
 
-                        progress = int(status.progress() * 100)
-                        elapsed_time = time.time() - start_time
-                        if elapsed_time > 0:
-                            speed_mb = (
-                                status.resumable_progress / (1024 * 1024)
-                            ) / elapsed_time
-                            log_print(
-                                f"\r   ⏳ Tiến độ: {progress}% hoàn thành | Tốc độ: {speed_mb:.1f} MB/s   ",
-                                is_progress=True,
-                            )
-                        else:
-                            log_print(
-                                f"\r   ⏳ Tiến độ: {progress}% hoàn thành...",
-                                is_progress=True,
-                            )
+                    if saved_uri:
+                        log_print(f"{thread_tag}⚡ Khôi phục phiên tải lên dang dở của: {file_name}...")
+                        request.resumable_uri = saved_uri
+                        request.resumable_progress = 0
+
+                    response = None
+                    start_time = time.time()
+                    first_chunk = True
+                    max_speed_mb = float(CONFIG.get("MAX_UPLOAD_SPEED_MBPS", 0))
+
+                    while response is None:
+                        chunk_start = time.time()
+                        status, response = request.next_chunk()
+
+                        if first_chunk and session_file and request.resumable_uri:
+                            with open(session_file, "w") as f:
+                                json.dump({"uri": request.resumable_uri}, f)
+                            first_chunk = False
+
+                        if status:
+                            chunk_elapsed = time.time() - chunk_start
+                            if max_speed_mb > 0:
+                                expected_time = (chunk_size / (1024 * 1024)) / max_speed_mb
+                                if chunk_elapsed < expected_time:
+                                    time.sleep(expected_time - chunk_elapsed)
+
+                            progress = int(status.progress() * 100)
+                            elapsed_time = time.time() - start_time
+                            if elapsed_time > 0:
+                                speed_mb = (
+                                    status.resumable_progress / (1024 * 1024)
+                                ) / elapsed_time
+                                log_print(
+                                    f"\r   ⏳ Tiến độ: {progress}% hoàn thành | Tốc độ: {speed_mb:.1f} MB/s   ",
+                                    is_progress=True,
+                                )
+                            else:
+                                log_print(
+                                    f"\r   ⏳ Tiến độ: {progress}% hoàn thành...",
+                                    is_progress=True,
+                                )
+                    
+                    # Upload thành công, thoát khỏi vòng retry
+                    break
+
+                except RETRYABLE_NETWORK_ERRORS as e:
+                    if attempt < len(RETRY_DELAYS):
+                        delay = RETRY_DELAYS[attempt]
+                        log_print(f"\n⚠️ {thread_tag}Lỗi mạng ({e.__class__.__name__}): {file_name}. Thử lại sau {delay}s (lần {attempt+1})...")
+                        time.sleep(delay)
+                    else:
+                        raise e
                 except HttpError as e:
-                    if e.resp.status in [404, 401, 403, 400]:
+                    if e.resp.status in [500, 502, 503, 504] and attempt < len(RETRY_DELAYS):
+                        delay = RETRY_DELAYS[attempt]
+                        log_print(f"\n⚠️ {thread_tag}Lỗi server Google ({e.resp.status}): {file_name}. Thử lại sau {delay}s (lần {attempt+1})...")
+                        time.sleep(delay)
+                    elif e.resp.status in [404, 401, 403, 400]:
                         if session_file and os.path.exists(session_file):
                             os.remove(session_file)
                         log_print(
@@ -409,8 +435,7 @@ class GoogleDriveManager:
                         # Truyền lại service để không mất thread-safety
                         return self.upload_file(file_path, existing_file_id, parent_id, service)
                     else:
-                        raise
-
+                        raise e
 
             # Luôn hiển thị 100% khi kết thúc để người dùng yên tâm
             log_print(
