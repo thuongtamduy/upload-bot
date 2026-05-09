@@ -94,6 +94,40 @@ python main.py
 ---
 Chúc bạn sử dụng hiệu quả! 🛠️
 
+## 🔧 Xử lý sự cố (Troubleshooting)
+
+### ❌ Lỗi `ssl.SSLError: [SSL: WRONG_VERSION_NUMBER]` trên macOS
+
+**Triệu chứng:**
+```
+ssl.SSLError: [SSL: WRONG_VERSION_NUMBER] wrong version number (_ssl.c:2633)
+```
+
+**Nguyên nhân:** Máy đang dùng Python từ **Xcode CommandLineTools** (`/Library/Developer/CommandLineTools/...`). Python này được Apple đóng gói kèm OpenSSL phiên bản cũ, không hỗ trợ TLS hiện đại mà Google Drive API yêu cầu.
+
+**Cách kiểm tra:**
+```bash
+which python3
+# Nếu output là /Library/Developer/CommandLineTools/... → bị lỗi này
+```
+
+**Cách fix:**
+```bash
+# 1. Cài Homebrew (nếu chưa có)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# 2. Cài Python qua Homebrew (đi kèm OpenSSL hiện đại)
+brew install python
+
+# 3. Xóa venv cũ và chạy lại
+rm -rf venv
+./scripts/run_mac.sh
+```
+
+> **Lưu ý:** Script `run_mac.sh` đã được tích hợp kiểm tra tự động và sẽ cảnh báo nếu phát hiện bạn đang dùng Python từ CommandLineTools.
+
+---
+
 ## 📄 License
 
 Project này được phát hành dưới bản quyền **MIT License**. Bạn hoàn toàn có quyền sử dụng, sửa đổi và phân phối lại mã nguồn này cho mục đích cá nhân hoặc thương mại.

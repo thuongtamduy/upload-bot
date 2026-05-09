@@ -18,6 +18,22 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
+# Kiểm tra xem Python có phải từ Xcode CommandLineTools không (SSL bị lỗi)
+PYTHON_PATH="$(which python3)"
+if [[ "$PYTHON_PATH" == *"CommandLineTools"* ]]; then
+    echo ""
+    echo "⚠️  CẢNH BÁO: Python đang dùng là từ Xcode CommandLineTools:"
+    echo "   $PYTHON_PATH"
+    echo "   Python này đi kèm OpenSSL cũ, KHÔNG tương thích với Google Drive API."
+    echo ""
+    echo "   👉 Vui lòng cài Python qua Homebrew:"
+    echo "      brew install python"
+    echo "   Sau đó xóa thư mục venv cũ (nếu có): rm -rf venv"
+    echo "   Rồi chạy lại script này."
+    echo ""
+    exit 1
+fi
+
 # Tạo venv nếu chưa có
 if [ ! -d "venv" ]; then
     echo "📦 Đang tạo môi trường ảo venv..."
