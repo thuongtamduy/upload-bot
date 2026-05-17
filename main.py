@@ -427,19 +427,30 @@ class GoogleDriveManager:
                             os.remove(session_file)
                         raise e
                 except HttpError as e:
-                    if e.resp.status in [500, 502, 503, 504] and attempt < len(RETRY_DELAYS):
+                    if e.resp.status in [403, 429, 500, 502, 503, 504] and attempt < len(RETRY_DELAYS):
                         delay = RETRY_DELAYS[attempt]
                         prog_info = f" [Đã up: {last_progress_mb:.1f}/{file_size_mb:.1f} MB]" if 'last_progress_mb' in locals() and last_progress_mb > 0 else ""
-                        log_print(f"\n⚠️ {thread_tag}Lỗi server Google ({e.resp.status}): {file_name}{prog_info}. Thử lại sau {delay}s (lần {attempt+1}/{len(RETRY_DELAYS)})...")
+                        error_details = getattr(e, 'content', b'').decode('utf-8', errors='ignore')
+                        log_print(f"\n⚠️ {thread_tag}Lỗi HTTP {e.resp.status}: {file_name}{prog_info}. Chi tiết: {error_details}. Thử lại sau {delay}s (lần {attempt+1}/{len(RETRY_DELAYS)})...")
                         time.sleep(delay)
-                    elif e.resp.status in [404, 401, 403, 400]:
-                        if session_file and os.path.exists(session_file):
-                            os.remove(session_file)
-                        log_print(
-                            f"\n⚠️ {thread_tag}Phiên tải lên cũ đã hết hạn. Đang tải lại từ đầu..."
-                        )
-                        # Truyền lại service để không mất thread-safety
-                        return self.upload_file(file_path, existing_file_id, parent_id, service)
+                    elif e.resp.status in [404, 401, 410]:
+                        if getattr(request, 'resumable_uri', None) or saved_uri:
+                            if session_file and os.path.exists(session_file):
+                                os.remove(session_file)
+                            log_print(
+                                f"\n⚠️ {thread_tag}Phiên tải lên cũ đã hết hạn (HTTP {e.resp.status}). Đang tải lại từ đầu..."
+                            )
+                            # Truyền lại service để không mất thread-safety
+                            return self.upload_file(file_path, existing_file_id, parent_id, service)
+                        elif e.resp.status == 404 and existing_file_id:
+                            log_print(
+                                f"\n⚠️ {thread_tag}File đích không tồn tại trên Drive. Sẽ tạo file mới..."
+                            )
+                            return self.upload_file(file_path, None, parent_id, service)
+                        else:
+                            if session_file and os.path.exists(session_file):
+                                os.remove(session_file)
+                            raise e
                     else:
                         if attempt == len(RETRY_DELAYS) and session_file and os.path.exists(session_file):
                             os.remove(session_file)
